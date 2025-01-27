@@ -1,0 +1,1392 @@
+---
+title: "StatisticalLearning"
+author: "Leire Domínguez-Sol Sastre, Marta Palacios Merinero, Leire Pantoja Jiménez"
+date: "2024-12-02"
+output: rmdformats::readthedown
+---
+
+```{r setup, include=FALSE, message=FALSE, comment=NULL, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE, comment=NULL}
+library(imager)
+library(jpeg)
+library(ggplot2)
+library(kableExtra)
+library(tidyr)
+```
+
+# MEMBERS OF THE PROJECT
+
+-   Leire Pantoja Jimenez - 100452928
+
+-   Marta Palacios Merinero - 100451470
+
+-   Leire Domiguez-Sol - 100452054
+
+# PART A
+
+## LOAD THE DATA AND READ THE IMAGES
+
+*Note: If this part of the code want to be executed, please make sure that the data (images) are in the same folder as where this code is located*
+
+The initial step in the implementation of the facial recognition system involves loading and preprocessing the dataset of facial images. The following function, `load_images_with_labels`, systematically processes a collection of image files, extracts their pixel information, and prepares them for further analysis.
+
+The function begins by identifying all `.jpg` image files within a specified folder using `list.files`. Once the images are listed, the dimensions of the first image are inspected using `readJPEG`. This step ensures the function captures the height, width, and number of channels (grayscale or RGB) of the images. This information is essential for initializing the matrix that will store the pixel data from all images.
+
+-   **Grayscale Images:** If an image lacks RGB channels (2D array), its pixel values are flattened into a vector.
+
+-   **RGB Images:** If the image contains three color channels (Red, Green, Blue), each channel is flattened individually and then concatenated into a single vector.
+
+These vectors are stored row-wise in a matrix, where each row corresponds to one image, and each column represents a pixel value from the image.
+
+Labels are extracted from the file names. The function assumes that the numeric portion of the image file name corresponds to its label. Using `strsplit`, the numeric identifier is isolated and stored in a vector.
+
+The final output of the function is a list containing:
+
+1.  **`photo` (labels):** A vector with the numeric identifiers corresponding to each image.
+
+2.  **`x` (features):** A matrix where each row represents an image, and the columns represent the pixel intensities across all channels.
+
+```{r}
+# Function to load, process images (RGB channels separated), and extract labels
+load_images_with_labels <- function(folder_path) {
+  # List all JPG files in the folder
+  file_list <- list.files(folder_path, pattern = "\\.jpg$", full.names = TRUE)
+  
+  # Check the dimensions of the first image to determine the size
+  first_img <- readJPEG(file_list[1])
+  img_height <- dim(first_img)[1]
+  img_width <- dim(first_img)[2]
+  num_channels <- ifelse(length(dim(first_img)) == 3, dim(first_img)[3], 1)
+  
+  # Initialize a matrix to store all images with RGB channels separated
+  image_matrix <- matrix(0, nrow = length(file_list), ncol = img_height * img_width * num_channels)
+  
+  # Initialize a vector to store labels
+  labels <- rep(NA, length(file_list))
+  
+  # Loop through each image
+  for (i in 1:length(file_list)) {
+    img <- readJPEG(file_list[i])
+    
+    if (length(dim(img)) == 2) {
+      # Grayscale image (no RGB channels)
+      img_vector <- as.vector(img)
+      image_matrix[i, ] <- img_vector
+    } else if (length(dim(img)) == 3) {
+      # RGB image: separate channels
+      colors <- apply(img, 3, as.vector)  
+      image_matrix[i, ] <- as.vector(t(c(colors[,1], colors[,2], colors[,3])))
+    }
+    
+    # Extract label from the file name
+    photo_name <- strsplit(basename(file_list[i]), "[A-Z]+", perl = TRUE)[[1]][1]
+    labels[i] <- as.numeric(photo_name)
+  }
+  
+  # Return a data frame with labels and image data
+  return (list(photo = labels, x = image_matrix, height = img_height, width = img_width))
+}
+
+image_folder <- getwd()
+images <- load_images_with_labels(image_folder)
+
+features <- images$x
+labels <- images$photo
+img_height <- images$height
+img_width <- images$width
+
+```
+
+## TRAIN Y TEST
+
+The dataset has been split into **training** and **testing** subsets while ensuring that each unique label (or class) is represented in both sets. The approach guarantees that the test set contains one sample from each class, and the remaining samples are assigned to the training set.
+
+```{r}
+set.seed(42)
+unique_labels <- unique(labels)
+
+test_indices <- c()
+train_indices <- c()
+
+for (label in unique_labels) {
+  label_indices <- which(labels == label)
+  
+  test_index <- sample(label_indices, 1)
+  test_indices <- c(test_indices, test_index)
+
+  train_indices <- c(train_indices, setdiff(label_indices, test_index))
+}
+
+train_data <- features[train_indices, ]
+test_data <- features[test_indices, ]
+train_labels <- labels[train_indices]
+test_labels <- labels[test_indices]
+
+```
+
+## A) PCA Function
+
+The `pca_large_p` function implements **Principal Component Analysis (PCA)** for datasets where the number of features (columns) far exceeds the number of observations (rows). This approach avoids directly computing the covariance matrix of the original data, which would be computationally prohibitive in high-dimensional spaces. Instead, it leverages a smaller intermediate matrix to efficiently extract principal components.
+
+Rather than directly computing the covariance matrix of size `p × p` (where `p` is the number of features), the function calculates the **Gram matrix (G \* Gᵀ)**, which is significantly smaller (`n × n`, where `n` is the number of observations). This matrix captures the relationships between observations rather than features, making it computationally manageable.
+
+The function calculates the **eigenvalues** and **eigenvectors** of the Gram matrix using `eigen`. The eigenvalues represent the amount of variance explained by each principal component, while the eigenvectors represent the directions of these principal components in the reduced space.
+
+The **explained variance** for each principal component is calculated by dividing each eigenvalue by the sum of all eigenvalues. This provides insight into the proportion of total variance captured by each principal component.
+
+The function returns:
+
+-   **mean:** The mean vector used for centering the data.
+
+-   **P:** The matrix of principal component eigenvectors.
+
+-   **D:** The proportion of variance explained by each principal component.
+
+```{r}
+pca_large_p <- function(data) {
+  # Calculate the mean of each column (feature)
+  data_mean <- colMeans(data)
+  
+  # Center the data (G = X - mean)
+  centered_data <- sweep(data, 2, data_mean, "-")
+  
+  # Compute G * G^T (small matrix, size n x n)
+  gram_matrix <- tcrossprod(centered_data) / (nrow(data) - 1)
+  
+  # Eigenvalues and eigenvectors of the small matrix
+  small_eigen <- eigen(gram_matrix)
+  small_eigenvalues <- small_eigen$values
+  small_eigenvectors <- small_eigen$vectors
+  
+  # Recover the eigenvectors of the large matrix G^T * G
+  eigenvectors <- t(centered_data) %*% small_eigenvectors
+  eigenvectors <- sweep(eigenvectors, 2, sqrt(small_eigenvalues), "/") # Normalize
+  
+  # Variance explained by each principal component
+  explained_variance <- small_eigenvalues / sum(small_eigenvalues)
+  
+  return(list(mean = data_mean, P = eigenvectors, D = explained_variance))
+}
+```
+
+```{r}
+# Apply PCA using the pca_large_p function
+pca_result <- pca_large_p(train_data)
+
+# Extract the explained variance (D)
+explained_variance <- pca_result$D
+
+# Compute the cumulative variance explained
+cumulative_variance <- cumsum(explained_variance)
+
+# Plot the cumulative variance
+plot(
+  cumulative_variance,
+  type = "o",  # Line and points
+  col = "blue",
+  pch = 16,
+  xlab = "Number of Principal Components",
+  ylab = "Cumulative Explained Variance",
+  main = "Cumulative Variance Explained by Principal Components"
+)
+
+# Add a threshold line at 95% variance
+abline(h = 0.95, col = "red", lty = 2)
+abline(h = 0.90, col = "green", lty = 2)
+
+# Add a legend
+legend(
+  "bottomright",
+  legend = c("Cumulative Variance", "95% Threshold"),
+  col = c("blue", "red"),
+  lty = c(1, 2),
+  pch = c(16, NA),
+  bty = "n"
+)
+
+```
+
+### KNN function
+
+#### HP OPTIMIZATION FOR KNN
+
+The following code conducts **Hyperparameter Optimization (HPO)** for a **k-Nearest Neighbors (k-NN)** classifier using **k-Fold Cross-Validation**. The goal is to identify the best combination of two hyperparameters:
+
+1.  **Number of Neighbors (k)**: Controls how many nearest points are considered for classification.
+
+2.  **Distance Metric**: Defines how the distance between data points is measured (e.g., Euclidean, Manhattan, Canberra).
+
+This process ensures that the chosen hyperparameters generalize well to unseen data and do not overfit or underfit the training data.
+
+The function `original_knn_classifier` predicts the label of a test image based on the training data, training labels, and specified hyperparameters.
+
+1.  **Distance Calculation:**\
+    The distance between the test image and each training sample is computed using one of the following metrics:
+
+    -   **Euclidean:** Standard straight-line distance.
+
+    -   **Manhattan:** Sum of absolute differences.
+
+    -   **Canberra:** Weighted sum of absolute differences.
+
+2.  **Neighbor Selection:**\
+    The `k` nearest neighbors are selected based on the calculated distances.
+
+The most frequently occurring label among the `k`nearest neighbors is chose as the predicted label.
+
+```{r}
+original_knn_classifier <- function(test_image, train_data, train_labels, k = 10, distance_metric = "euclidean") {
+  calculate_distance <- function(x, y) {
+    if (distance_metric == "euclidean") {
+      return(sqrt(sum((x - y)^2)))
+    } else if (distance_metric == "manhattan") {
+      return(sum(abs(x - y)))
+    } else if (distance_metric == "canberra") {
+      return(sum(abs(x - y) / (abs(x) + abs(y) + .Machine$double.eps))) 
+    } else if (distance_metric == "minkowski") {
+      return(sum(abs(x - y)^2)^(1 / 2))
+    } else {
+      stop("No supported metric.")
+    }
+  }
+  
+  distances <- apply(train_data, 1, function(x) calculate_distance(x, test_image))
+  
+  nearest_neighbors <- order(distances)[1:k]
+  
+  predicted_label <- names(sort(table(train_labels[nearest_neighbors]), decreasing = TRUE))[1]
+  
+  return(as.integer(predicted_label))
+}
+
+```
+
+The function `k_fold_knn` optimizes the hyperparameters using **k-Fold Cross-Validation (k=5)**, which splits the dataset into five equal subsets (folds). Each fold is used as a test set once, while the remaining four folds serve as the training set.
+
+1.  **Dataset Splitting:**\
+    The dataset is partitioned into training and testing subsets based on the current fold.
+
+2.  **Hyperparameter Iteration:**\
+    For every combination of `k` and `distance_metric`, the classifier is trained and evaluated.
+
+3.  **Performance Evaluation:**\
+    Accuracy is computed as the proportion of correctly classified test samples in each fold.
+
+4.  **Aggregation:**\
+    The mean accuracy across all folds is calculated for each combination of `k` and `distance_metric`.
+
+```{r}
+# Function to perform k-fold cross-validation for k-NN
+k_fold_knn <- function(data, labels, k_values, distance_metrics, folds = 5) {
+  # Create indices for the folds
+  set.seed(42)  # Ensure reproducibility
+  fold_indices <- sample(rep(1:folds, length.out = nrow(data)))
+  
+  # Create a data.frame to store results
+  results <- expand.grid(k = k_values, distance = distance_metrics, fold = 1:folds)
+  results$accuracy <- NA
+  
+  # Iterate over each fold
+  for (fold in 1:folds) {
+    # Split the data into training and testing subsets
+    train_data <- data[fold_indices != fold, ]
+    train_labels <- labels[fold_indices != fold]
+    test_data <- data[fold_indices == fold, ]
+    test_labels <- labels[fold_indices == fold]
+    
+    # Evaluate each combination of k and distance metric
+    for (i in 1:nrow(results)) {
+      if (results$fold[i] == fold) {
+        k <- results$k[i]
+        distance_metric <- results$distance[i]
+        
+        # Predict labels for the test set
+        predicted_labels <- sapply(1:nrow(test_data), function(j) {
+          original_knn_classifier(test_data[j, ], train_data, train_labels, k = k, distance_metric = distance_metric)
+        })
+        
+        # Calculate accuracy
+        accuracy <- sum(predicted_labels == test_labels) / length(test_labels)
+        results$accuracy[i] <- accuracy
+      }
+    }
+  }
+  
+  # Average accuracy for each combination of k and distance metric
+  final_results <- aggregate(accuracy ~ k + distance, data = results, FUN = mean)
+  
+  return(final_results)
+}
+
+```
+
+After identifying the best-performing hyperparameter combination, the model is evaluated on an independent test set to validate its performance.
+
+1.  Predictions are made using the optimized `k` and `distance_metric`.
+
+2.  Accuracy is computed on the test set.
+
+```{r}
+evaluate_knn <- function(train_data, train_labels, test_data, test_labels, k_values, distance_metrics) {
+  results <- expand.grid(k = k_values, distance = distance_metrics)
+  results$accuracy <- NA
+  
+  for (i in 1:nrow(results)) {
+    k <- results$k[i]
+    distance_metric <- results$distance[i]
+    
+    predicted_labels <- sapply(1:nrow(test_data), function(j) {
+      original_knn_classifier(test_data[j, ], train_data, train_labels, k = k, distance_metric = distance_metric)
+    })
+    
+    accuracy <- sum(predicted_labels == test_labels) / length(test_labels)
+    results$accuracy[i] <- accuracy
+  }
+  
+  return(results)
+}
+```
+
+```{r}
+# Values of the hyperparameters
+k_values <- c(3, 5, 10, 15, 20)
+distance_metrics <- c("euclidean", "manhattan", "canberra")
+
+results <- k_fold_knn(data = features, labels = labels, 
+                      k_values = k_values, distance_metrics = distance_metrics, 
+                      folds = 5)
+
+
+```
+
+```{r}
+results_ <- results %>%
+  pivot_wider(
+    names_from = distance,  # Convertir las métricas de distancia en columnas
+    values_from = accuracy  # Usar los valores de accuracy dentro de las celdas
+  )
+
+# Crear la tabla con el nuevo formato
+results_ %>%
+  kable(
+    caption = "5-Fold Cross-Validation Results for k-NN",  # Título de la tabla
+    format = "html",  # Formato HTML
+    align = "c"       # Centrar columnas
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),  
+    full_width = F  # No ocupar todo el ancho de la página
+  ) %>%
+  column_spec(1, bold = T, color = "white", background = "orange") %>%  # Resaltar la primera columna (k)
+  row_spec(0, bold = T, background = "#D3D3D3") 
+
+
+ggplot(results, aes(x = k, y = accuracy, color = distance, group = distance)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "5-Fold Cross-Validation of k-NN with Different Distance Metrics",
+    x = "Number of Neighbors (k)",
+    y = "Mean Accuracy",
+    color = "Metric"
+) +
+
+  theme_minimal()
+```
+
+-   For $k=3$ , the accuracy is highest across all three distance metrics, with `manhattan` and `canberra` achieving perfect accuracy (1.0000), while `euclidean` also performs exceptionally well with 0.9933 accuracy.
+
+-   For $k = 5$, follows with slightly lower, yet very competitive accuracies: `manhattan` (0.9667), `canberra` (0.9600), and `euclidean` (0.9267).
+
+-   As $k$ increases to 10, 15, and 20, there is a noticeable decline in accuracy across all distance metrics. This trend suggests that using too many neighbors reduces the model's ability to effectively classify the data, likely due to oversmoothing the decision boundaries.
+
+The best combination, based on this analysis, is $k = 3$ with either the `manhattan` or `canberra` distance metric. Both yield perfect accuracy (1.0000), making them the most reliable and effective configurations for this specific dataset and task. We will choose for our project the `manhattan distance.`
+
+### FINAL KNN
+
+Once the best hyperparameters---such as the optimal number of neighbors (`k`) and the most suitable distance metric---have been determined through hyperparameter optimization (HPO) and cross-validation, the `final_knn` function is used as the final implementation of the classifier for prediction tasks. This function streamlines the classification process by focusing on a single distance metric (Manhattan) and uses the selected `k` value.
+
+```{r, warning=F}
+final_knn <- function(test_image, train_data, train_labels, k = 3) {
+  test_image <- as.numeric(test_image)  
+  distances <- apply(train_data, 1, function(x) sum(abs(as.numeric(x) - test_image)))
+  nearest_neighbors <- order(distances)[1:k]
+  predicted_label <- names(sort(table(train_labels[nearest_neighbors]), decreasing = TRUE))[1]
+  neighbor_labels <- train_labels[nearest_neighbors]
+  return(list(predicted_label = as.integer(predicted_label), num_distances = length(distances), nearest_neighbors= nearest_neighbors))
+}
+```
+
+## B) PCA + KNN
+
+The next step combines Principal Component Analysis (PCA) and K-Nearest Neighbors (K-NN) to classify images efficiently. PCA reduces the dimensionality of the image data, retaining only the most significant components that explain a specified percentage of the variance, while K-NN uses this reduced representation to classify test images.
+
+The function starts by applying PCA to the training data to reduce its dimensionality:
+
+-   **Mean and Principal Components Calculation:**\
+    PCA is applied to the training data using the `pca_func`. This function returns the mean of the dataset (`pca_mean`), the matrix of principal components (`pca_matrix`), and the explained variance for each component (`explained_variance`).
+
+-   **Variance Threshold for Component Selection:**\
+    The cumulative variance explained by the components is computed. Components are selected based on a specified `variance_threshold`. This ensures that the reduced PCA space retains enough information for effective classification.
+
+-   **Projection into Reduced Space:**\
+    The training data is centered using the mean (`train_data - pca_mean`) and projected into the reduced PCA space defined by the selected components.
+
+The `final_knn` function is then used to classify the test image:
+
+-   The test image is compared to the reduced training data using the optimal $k$ value determined during hyperparameter optimization.
+
+-   The predicted class is the label most frequently occurring among the $k$ nearest neighbors.
+
+To verify the reliability of the classification, a two-step threshold mechanism has been implemented.
+
+**First Threshold: Validation Using Pairwise Distances**
+
+-   The Manhattan distances between all images of the predicted class in the training dataset are computed and stored in the `pairwise_distances`
+
+-   Then, the Manhattan distance from the test image to each image of the predicted class is calculated.
+
+-   Each test image distance is compared to all pairwise distances with a 10% deviation margin. If the test image's distance is less than or equal to at least one of the adjusted pairwise distances, the classification is deemed reliable. Otherwise, it is flagged for further verification.
+
+**Second Threshold: Verification with Other Neighbors**
+
+If the first threshold fails, the function checks all other neighbors returned by the K-NN function. For each neighbor:
+
+-   The other neighbor's class is identified, and the distances from the test image to the images of this class are calculated.
+
+-   The same threshold logic is applied: the test image's distance must be less than or equal to any pairwise distance within the class, adjusted by a 10% deviation.
+
+If a neighbor passes this validation, its class is returned as the result. If no neighbor satisfies the threshold, the test image is classified as unrecognized (`0`).
+
+The function returns two results for each test image:
+
+1.  **result_1:**\
+    The predicted class if the test image passes the thresholds, otherwise `0`. This is used to evaluate the accuracy of the PCA + KNN function with all thresholds implemented. It ensures that the predicted class not only matches but is also validated by the distance criteria.
+
+2.  **result_2:**\
+    The predicted class regardless of the thresholds, allowing for a more lenient evaluation. This is used to evaluate the accuracy of the standard K-NN classifier without additional validation steps.
+
+This two-step threshold mechanism significantly enhances the reliability of the classification by validating both the predicted class and its proximity to other neighbors, ensuring that the function effectively handles edge cases and ambiguous predictions.
+
+```{r}
+# PCA and k-NN based classifier with two thresholds
+pca_knn_classifier <- function(test_image, train_data, train_labels, pca_func, k = 3, variance_threshold = 0.95) {
+  # Apply PCA to the training data
+  pca_result <- pca_func(train_data)
+  pca_mean <- pca_result$mean
+  pca_matrix <- pca_result$P
+  explained_variance <- pca_result$D
+
+  # Reduce the principal components based on the variance threshold
+  cumulative_variance <- cumsum(explained_variance)
+  selected_components <- which(cumulative_variance <= variance_threshold)
+  reduced_pca_matrix <- pca_matrix[, selected_components]
+
+  # Project the test image into the reduced PCA space
+  centered_image <- test_image - pca_mean
+  reduced_projected_image <- as.vector(centered_image %*% reduced_pca_matrix)
+
+  # Project the training images into the reduced PCA space
+  reduced_training_data <- (train_data - pca_mean) %*% reduced_pca_matrix
+
+  # Classify the test image using the final_knn function
+  knn_result <- final_knn(
+    test_image = reduced_projected_image,
+    train_data = reduced_training_data,
+    train_labels = train_labels,
+    k = k
+  )
+  
+  predicted_class <- knn_result$predicted_label
+  neighbors <- knn_result$nearest_neighbors
+  
+  # Filter the images in the dataset that belong to the predicted class
+  class_indices <- which(train_labels == predicted_class)
+  class_images <- train_data[class_indices, ]
+
+  # 1. Calculate the pairwise distances between the images of the predicted class (Manhattan distance)
+  pairwise_distances <- dist(class_images, method = "manhattan")
+  pairwise_distances <- as.numeric(pairwise_distances)
+  
+  # 2. Calculate the Manhattan distances from the test image to each image of the predicted class
+  distances_to_class <- apply(class_images, 1, function(x) sum(abs(x - test_image)))
+
+  # 3. First threshold: Check if any test image distance is <= any pairwise distance (+10% deviation)
+  first_threshold_results <- sapply(distances_to_class, function(dist) {
+    any(dist <= (pairwise_distances + 0.1 * pairwise_distances))
+  })
+
+ 
+  if (any(first_threshold_results)) {
+   
+    return(list(result_1 = predicted_class, result_2 = predicted_class))
+  } else {
+     # If the first threshold fails, check other neighbors with the second threshold
+    for (neighbor_idx in neighbors) {
+      neighbor_label <- train_labels[neighbor_idx]
+      if (neighbor_label != predicted_class) {
+        # Get images for the current neighbor class
+        neighbor_class_indices <- which(train_labels == neighbor_label)
+        neighbor_class_images <- train_data[neighbor_class_indices, ]
+        
+        # Calculate distances to the test image
+        neighbor_distances <- apply(neighbor_class_images, 1, function(x) sum(abs(x - test_image)))
+        
+        # Check if any distance is valid using the same logic
+        neighbor_pairwise_distances <- dist(neighbor_class_images, method = "manhattan")
+        neighbor_pairwise_distances <- as.numeric(neighbor_pairwise_distances)
+        second_threshold_results <- sapply(neighbor_distances, function(dist) {
+          any(dist <= (neighbor_pairwise_distances + 0.1 * neighbor_pairwise_distances))
+        })
+        
+        if (any(second_threshold_results)) {
+          return(list(result_1 = neighbor_label, result_2 = predicted_class))
+        }
+      }
+    }
+    
+    # If no valid neighbor class is found, return 0
+    return(list(result_1 = 0, result_2 = predicted_class))
+  }
+}
+
+```
+
+The `predict_pca_knn` function applies the PCA-based k-NN classifier to a batch of test images:
+
+1.  It iterates through each test image and applies the `pca_knn_classifier`.
+
+2.  The results for all test images are aggregated into two vectors (`result_1` and `result_2`), corresponding to the two types of classification outputs.
+
+```{r}
+# Classify a set of test images using PCA and k-NN
+predict_pca_knn <- function(test_data, train_data, train_labels, pca_func, k = 3, variance_threshold = 0.95) {
+  # Apply the PCA-based k-NN classifier to each test image
+  results <- lapply(1:nrow(test_data), function(i) {
+    pca_knn_classifier(
+      test_image = test_data[i, ],
+      train_data = train_data,
+      train_labels = train_labels,
+      pca_func = pca_func,
+      k = k,
+      variance_threshold = variance_threshold
+    )
+  })
+  
+  # Extract result_1 and result_2 for all test images
+  result_1 <- sapply(results, function(x) x$result_1)
+  result_2 <- sapply(results, function(x) x$result_2)
+  
+  return(list(result_1 = result_1, result_2 = result_2))
+}
+
+
+```
+
+The function `evaluate_label_existence`, calculates a secondary accuracy metric to evaluate predictions for specific cases where:
+
+1.  If the predicted label is `0`, the function checks if the true label (`test_labels`) does not exist in the training dataset (`train_labels`).
+
+2.  If the predicted label is a valid class, the function checks if it matches the true label.
+
+3.  The function calculates accuracy based on these criteria.
+
+To do this, the function takes three arguments: `predicted_labels`, which is a vector of predicted labels for test samples (with `0` representing an unrecognized label); `test_labels`, which contains the true labels for the test samples; and `train_labels`, which holds the labels present in the training dataset.
+
+The function iterates through each predicted label using `sapply`. For each test sample, it retrieves the predicted label (`predicted`) and the true label (`real`). If the predicted label is `0`, the function checks whether the true label is present in the training dataset (`real %in% train_labels`). If the true label is in the training set, it means the function incorrectly predicted that the label is unrecognized, and the result is `FALSE`. Conversely, if the true label is not in the training set, the prediction is considered correct, and the result is `TRUE`.
+
+If the predicted label is a valid class (not `0`), the function checks whether the predicted label matches the true label (`predicted == real`). A match results in `TRUE`, while a mismatch results in `FALSE`. These checks are aggregated into a logical vector called `correctness`, where each entry represents whether the prediction for a specific test sample meets the criteria.
+
+Finally, the function calculates the secondary accuracy as the mean of the `correctness` vector, representing the proportion of correct predictions based on the defined conditions. This metric captures the model's ability to handle both correctly recognized classes and unrecognized samples. The function returns this secondary accuracy value.
+
+```{r}
+# Secondary accuracy evaluation
+evaluate_label_existence <- function(predicted_labels, test_labels, train_labels) {
+  # Check for each prediction whether it is correct
+  correctness <- sapply(1:length(predicted_labels), function(i) {
+    predicted <- predicted_labels[i]
+    real <- test_labels[i]
+    
+    if (predicted == 0) {
+      # If the prediction is 0, verify if the true label exists in the training dataset
+      if (real %in% train_labels==TRUE){ # if function said 0 but the person trully is in the dataset --> FALSE because the function didnt work correctly
+        return(FALSE)
+      }else{ # else TRUE because the function worked properly 
+        return(TRUE)
+      }
+    } else {
+      # If the prediction is valid, verify if it matches the true label
+      return(predicted == real)
+    }
+  })
+  # Calculate the secondary accuracy
+  secondary_accuracy <- mean(correctness)
+  return(secondary_accuracy)
+}
+```
+
+```{r, warning = F}
+# prediction using PCA and k-NN
+predicted_results  <- predict_pca_knn(
+  test_data = test_data,
+  train_data = train_data,
+  train_labels = train_labels,
+  pca_func = pca_large_p,  # PCA
+  k = 3,
+  variance_threshold = 0.95  
+)
+
+predicted_labels_1 <- predicted_results$result_1
+predicted_labels_2 <- predicted_results$result_2
+# precission for knn
+accuracy <- mean(predicted_labels_2 == test_labels)
+cat("Precision for classifier (KNN):", accuracy, "\n")
+
+#precission for function 
+accuracy_2 <- evaluate_label_existence(
+  predicted_labels = predicted_labels_1,
+  test_labels = test_labels,
+  train_labels = train_labels
+)
+cat("Secondary Accuracy (Validation of Labels in the Dataset):", accuracy_2, "\n")
+
+```
+
+The results indicate two different aspects of the classifier's performance:
+
+1.  **Precision for Classifier (KNN): 0.92**\
+    This means that the k-Nearest Neighbors (k-NN) classifier correctly predicted the label for 92% of the test images. However, this metric only considers whether the predicted label exactly matches the true label of the test image. In cases where the k-NN classifier fails, it might assign a class that is similar or close to the actual one but not identical. These misclassifications lower the precision of the k-NN classifier.
+
+2.  **Secondary Accuracy (Validation of Labels in the Dataset): 1**\
+    This shows that, even when the k-NN classifier might misclassify some images, the function's threshold mechanism successfully identifies whether the test image belongs to a known class in the training dataset or not. Specifically:
+
+    -   If the test image belongs to a class that is not present in the training dataset, the function correctly returns `0`, indicating "unrecognized".
+
+    -   If the test image belongs to a class present in the training dataset, the function correctly predicts the class.
+
+In other words, the **secondary accuracy validates the threshold's effectiveness** in determining whether an image is part of the dataset or not. This metric considers the broader objective of correctly identifying whether the label exists in the dataset, regardless of minor classification errors made by k-NN.
+
+These results reinforce the importance of the threshold mechanism, which acts as a safeguard in scenarios where k-NN predictions might falter, ensuring the overall accuracy of the system.
+
+### DISTRIBUTION PLOT FOR DISTANCES
+
+The function `calculate_distances` computes the pairwise Manhattan distances between all data points in a given dataset, separating these distances into two categories: "Same Label" and "Different Labels." It iterates through all pairs of data points, calculates the Manhattan distance for each pair, and assigns the distance to the appropriate category based on whether the two points share the same label. Once PCA is applied to the dataset, this function is used on the reduced-dimensional representation (`reduced_training_data`) to analyze how well PCA organizes the data by class. The resulting distances are then visualized in a density plot, highlighting the distinction between intra-class (same label) and inter-class (different labels) distances. This allows for an evaluation of the effectiveness of PCA in clustering similar data points and separating different classes.
+
+```{r, echo = FALSE}
+# Compute Pairwise Distances
+calculate_distances <- function(data, labels) {
+  same_label_distances <- c()
+  different_label_distances <- c()
+  
+  for (i in 1:(nrow(data) - 1)) {
+    for (j in (i + 1):nrow(data)) {
+      distance <- sum(abs(data[i, ] - data[j, ]))  # Manhattan distance
+      
+      if (labels[i] == labels[j]) {
+        # Same class
+        same_label_distances <- c(same_label_distances, distance)
+      } else {
+        # Different classes
+        different_label_distances <- c(different_label_distances, distance)
+      }
+    }
+  }
+  
+  return(list(same = same_label_distances, different = different_label_distances))
+}
+
+# Apply PCA and compute distances
+pca_result <- pca_large_p(train_data)  # Replace 'train_data' with your training dataset
+reduced_training_data <- (train_data - pca_result$mean) %*% pca_result$P  # PCA projection
+distances <- calculate_distances(reduced_training_data, train_labels)
+
+# Create a data frame for plotting
+distance_data <- data.frame(
+  Distance = c(distances$same, distances$different),
+  Type = c(rep("Same Label", length(distances$same)), rep("Different Labels", length(distances$different)))
+)
+
+# Plot the density
+ggplot(distance_data, aes(x = Distance, fill = Type)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("orange", "purple")) +
+  labs(
+    title = "Density Plot of Pairwise Distances (PCA)",
+    x = "Distance",
+    y = "Density",
+    fill = "Distance Type"
+  ) +
+  theme_minimal()
+
+```
+
+The plot representing the PCA-transformed data, shows a clear distinction between the pairwise distances of "Same Label" and "Different Labels." The "Same Label" distances (purple) are tightly clustered, with a smaller range, indicating that images within the same class are more similar in the reduced PCA space. In contrast, the "Different Labels" distances (yellow) are more spread out and shifted to higher values, reflecting greater dissimilarity between images from different classes. This separation suggests that the PCA transformation effectively organizes the data, making it easier to identify patterns and distinguish between classes, which is crucial for classification tasks like k-NN.
+
+### EVALUATION WITH AN IMAGE OUTSIDE THE TRAINING DATASET.
+
+This code is designed to test the effectiveness of the two accuracy metrics. The goal is to validate whether the threshold mechanism works as expected.
+
+In previous evaluations, the training and test datasets were separated in such a way that each class had at least one image present in both the training and test sets, making it easier for the classifier to recognize all classes. Now, we are enforcing a stricter condition where all images of the person with label `15` are moved exclusively to the test set, ensuring that none of their images are present in the training set. This creates a challenging scenario for the classifier, testing its ability to handle completely unseen classes.
+
+The code begins by creating a secondary dataset specifically designed for this evaluation:
+
+-   It identifies all indices corresponding to images with the label `15` (`label_15_indices`).
+
+-   The training dataset is then modified to exclude all images with this label (`secondary_train_data`), ensuring that the model does not have any prior exposure to this class during training.
+
+-   The test dataset is constructed to include only images with the label `15` (`secondary_test_data`), creating a challenging scenario where the model must classify a completely unseen class.
+
+This experiment provides a comprehensive test of the classifier's ability to handle both recognized and unrecognized images effectively.
+
+```{r, warning=FALSE}
+# Create a secondary dataset without altering the original data
+
+# Identify the indices of images with label 15
+label_15_indices <- which(labels == 15)
+
+# Create the secondary datasets
+secondary_train_indices <- setdiff(seq_along(labels), label_15_indices)  # All indices except those with label 15
+secondary_test_indices <- label_15_indices  # Only indices with label 15
+
+# Create secondary feature and label datasets
+secondary_train_data <- features[secondary_train_indices, ]
+secondary_train_labels <- labels[secondary_train_indices]
+
+secondary_test_data <- features[secondary_test_indices, ]
+secondary_test_labels <- labels[secondary_test_indices]
+
+# Test the classifier
+predicted_results_secondary <- predict_pca_knn(
+  test_data = secondary_test_data,
+  train_data = secondary_train_data,
+  train_labels = secondary_train_labels,
+  pca_func = pca_large_p, 
+  k = 3,
+  variance_threshold = 0.95
+)
+
+```
+
+```{r}
+# Evaluate accuracy
+predicted_labels_1_secondary <- predicted_results_secondary$result_1
+predicted_labels_2_secondary <- predicted_results_secondary$result_2
+accuracy_secondary <- mean(predicted_labels_2_secondary == secondary_test_labels)
+accuracy_primary <-evaluate_label_existence(predicted_labels_1_secondary, secondary_test_labels, secondary_train_labels)
+cat("Accuracy for image 15 all in test (KNN):", accuracy_secondary, "\n")
+cat("Validation accuracy for image 15 tests (expecte to have all predictions correctly flagged as not in dataset):", accuracy_primary, "\n")
+
+```
+
+The results highlight two distinct aspects of the classifier's performance, showcasing how the K-NN classifier and the validation mechanism behave when tested with images that belong to a class (label 15) entirely excluded from the training dataset.
+
+The K-NN classifier fails to correctly classify any of the test images for label 15. This outcome is expected because label 15 is not present in the training set. Without any prior knowledge of this class, the classifier assigns each test image to the nearest class based on the available training data. However, since none of these predictions match the true label (15), the K-NN accuracy for these test images is `0`. This reflects the inherent limitation of K-NN in handling classes that are not represented in the training dataset---it cannot recognize or flag images as "unknown" on its own.
+
+The validation mechanism, however, successfully handles the absence of label 15 in the training set. The function is designed to return `0` for any test image that does not belong to a class represented in the training data. In this case, since all test images for label 15 are correctly flagged as "not in the dataset," the validation accuracy is `1`. This result demonstrates that the function's threshold mechanism is working as intended:
+
+The discrepancy between the K-NN accuracy (`0`) and the validation accuracy (`1`) underscores the importance of the threshold mechanism. While K-NN alone struggles to handle unseen classes and misclassifies the test images, the validation function provides an additional layer of reliability. By effectively identifying and flagging instances that do not belong to the training dataset, the function ensures that the system is robust in scenarios involving unseen or out-of-distribution data.
+
+## C) DETERMINING PREVIOUS PARAMETERS
+
+#### 1. **The Percentage of Variance Retained by the Principal Components (PCs):**
+
+-   The percentage of variance retained determines the number of principal components used in the PCA + k-NN function. This parameter was set based on the cumulative explained variance. By plotting the cumulative variance curve, we identified the threshold where adding more components contributed marginally to the total variance explained.
+
+-   **Chosen Threshold:** We selected a variance threshold of 95% to preserve the majority of the data's information while reducing dimensionality. This ensures that the model captures significant patterns, improves computational efficiency, and minimizes the risk of overfitting, balancing accuracy and generalization effectively.
+
+#### 2. **The Number of Neighbors (kk) in k-NN:**
+
+-   The optimal value of $k$ was determined through hyperparameter optimization using k-fold cross-validation. For each value of $k$, the classifier's performance was evaluated, and the $k$that provided the highest mean accuracy across folds was selected.
+
+-   **Chosen Value:** $k=3$ was found to be optimal, providing a good balance between robustness and sensitivity to local patterns in the data. Higher valuesof $k$ led to oversmoothing, while lower values increased sensitivity to noise.
+
+#### 3. **The Similarity Metric:**
+
+-   The similarity metric used in k-NN and threshold calculations was chosen based on its ability to accurately reflect the relationships between data points in the feature space. It was selected through hyperparameter optimization (HPO) using k-fold cross-validation, where the performance of different distance metrics was evaluated.
+
+-   **Chosen Metric:** The **Manhattan distance** was selected over the other distances. Manhattan distance was more effective at handling high-dimensional data as it avoids exaggerating the influence of large differences in individual dimensions.
+
+#### 4. **The Threshold for Determining Database Membership:**
+
+-   The threshold mechanism was developed to validate whether a test image truly belongs to the predicted class or to any known class in the dataset. This involved:
+
+    -   **First Threshold:** Comparing the distances from the test image to all images in the predicted class with the pairwise distances within the class. If any test image distance was within 10% of the adjusted pairwise distances, it was considered a valid member of the predicted class.
+
+    -   **Second Threshold:** If the first threshold failed, the function checked other neighbors' classes using the same logic to identify whether the test image might belong to a different valid class in the dataset.
+
+-   **Threshold Adjustment:** The 10% margin was determined through experimentation to strike a balance between accepting minor variations and rejecting outliers. This threshold was validated by testing on classes that were excluded from the training set to simulate unseen data.
+
+## D) KNN without PCA
+
+*NOTE: Please avoid executing these functions since, without using PCA, it takes a very long time to execute!*
+
+The `classify_and_compare` function classifies a given image using the k-Nearest Neighbors (k-NN) algorithm and verifies the reliability of the classification by comparing the image's distance to the predicted class. It achieves this by calculating the mean pairwise distance of the predicted class and checking if the test image's distances to the images in this class meet the comparison criteria.
+
+Essentially, this function performs the same steps as the PCA + k-NN function but without applying PCA for dimensionality reduction. Instead, it directly uses the original dataset for classification and validation.
+
+```{r}
+classify_and_compare <- function(image, dataset, labels, k = 3) {
+  
+# Classify the test image using the final_knn function
+  knn_result <- final_knn(
+    test_image = image,
+    train_data = dataset,
+    train_labels = labels,
+    k = k
+  )
+  
+  predicted_class <- knn_result$predicted_label
+  neighbors <- knn_result$nearest_neighbors
+  
+  # Filter the images in the dataset that belong to the predicted class
+  class_indices <- which(train_labels == predicted_class)
+  class_images <- train_data[class_indices, ]
+
+  # 1. Calculate the pairwise distances between the images of the predicted class (Manhattan distance)
+  pairwise_distances <- dist(class_images, method = "manhattan")
+  pairwise_distances <- as.numeric(pairwise_distances)
+  
+  # 2. Calculate the Manhattan distances from the test image to each image of the predicted class
+  distances_to_class <- apply(class_images, 1, function(x) sum(abs(x - image)))
+
+  # 3. First threshold: Check if any test image distance is <= any pairwise distance (+10% deviation)
+  first_threshold_results <- sapply(distances_to_class, function(dist) {
+    any(dist <= (pairwise_distances + 0.1 * pairwise_distances))
+  })
+
+ 
+  if (any(first_threshold_results)) {
+   
+    return(list(result_1 = predicted_class, result_2 = predicted_class))
+  } else {
+     # If the first threshold fails, check other neighbors with the second threshold
+    for (neighbor_idx in neighbors) {
+      neighbor_label <- train_labels[neighbor_idx]
+      if (neighbor_label != predicted_class) {
+        # Get images for the current neighbor class
+        neighbor_class_indices <- which(train_labels == neighbor_label)
+        neighbor_class_images <- train_data[neighbor_class_indices, ]
+        
+        # Calculate distances to the test image
+        neighbor_distances <- apply(neighbor_class_images, 1, function(x) sum(abs(x - test_image)))
+        
+        # Check if any distance is valid using the same logic
+        neighbor_pairwise_distances <- dist(neighbor_class_images, method = "manhattan")
+        neighbor_pairwise_distances <- as.numeric(neighbor_pairwise_distances)
+        second_threshold_results <- sapply(neighbor_distances, function(dist) {
+          any(dist <= (neighbor_pairwise_distances + 0.1 * neighbor_pairwise_distances))
+        })
+        
+        if (any(second_threshold_results)) {
+          return(list(result_1 = neighbor_label, result_2 = predicted_class))
+        }
+      }
+    }
+    
+    # If no valid neighbor class is found, return 0
+    return(list(result_1 = 0, result_2 = predicted_class))
+  }
+}
+
+
+```
+
+```{r}
+# Create vectors to store classification results
+predicted_labels_1 <- vector("numeric", nrow(test_data))
+predicted_labels_2 <- vector("numeric", nrow(test_data))
+
+# Iterate over each image in the test dataset
+for (i in 1:nrow(test_data)) {
+    # Call the classify_and_compare function for each image
+  result <- classify_and_compare(
+    image = test_data[i, ],
+    dataset = train_data,
+    labels = train_labels,
+    k = 3
+  )
+  # Store the results
+  predicted_labels_1[i] <- result$result_1
+  predicted_labels_2[i] <- result$result_2
+  
+}
+
+```
+
+```{r}
+# Evaluate main accuracy
+accuracy <- mean(predicted_labels_2 == test_labels)
+cat("Accuracy for classifier (KNN):", accuracy, "\n")
+
+# Evaluate secondary accuracy
+accuracy_2 <- evaluate_label_existence(
+  predicted_labels = predicted_labels_1,
+  test_labels = test_labels,
+  train_labels = train_labels
+)
+cat("Secondary Accuracy (Validation of Labels in the Dataset):", accuracy_2, "\n")
+```
+
+Based on the results, while the original representation achieves slightly higher accuracy for the classifier (KNN), the secondary accuracy (validation of labels in the dataset) is identical for both representations. Despite the marginal drop in KNN accuracy with PCA (from 1 to 0.92), we prefer using the principal component representation because it significantly reduces the computational cost of the classification process.
+
+By reducing the dimensionality of the data, PCA decreases the number of features used in the k-NN algorithm, leading to faster distance calculations and neighbor searches. This efficiency is particularly important when working with large datasets or high-dimensional data, where the computational time and memory requirements for k-NN scale with the number of features.
+
+The slight trade-off in classifier accuracy (from 1 to 0.92) is justified by the substantial computational gains, as PCA allows the system to process data more efficiently without sacrificing the ability to validate labels accurately (secondary accuracy remains 1). Therefore, the principal component representation is a more practical and scalable choice for this problem.
+
+### DISTRIBUTION PLOT FOR DISTANCES
+
+This process uses the same function as before (`calculate_distances`) and is applied directly to the original dataset (`train_data`) without any dimensionality reduction. This provides insights into how well-separated the classes are in the original feature space and highlights the potential challenges of classification based on these distances.
+
+```{r}
+
+# Compute distances on the original data
+distances <- calculate_distances(train_data, train_labels)  # Replace 'train_data' and 'train_labels'
+
+# Create a data frame for plotting
+distance_data <- data.frame(
+  Distance = c(distances$same, distances$different),
+  Type = c(rep("Same Label", length(distances$same)), rep("Different Labels", length(distances$different)))
+)
+
+# Plot the density
+ggplot(distance_data, aes(x = Distance, fill = Type)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("orange", "purple")) +
+  labs(
+    title = "Density Plot of Pairwise Distances (Original Data)",
+    x = "Distance",
+    y = "Density",
+    fill = "Distance Type"
+  ) +
+  theme_minimal()
+
+```
+
+This plot represents the pairwise Manhattan distance distributions for the original data without applying PCA. The distances between points of the same label (purple) are tightly grouped but overlap significantly with the distances between points of different labels (orange). The overlap indicates that the original feature space does not provide clear separation between classes, making it more challenging for classifiers like k-NN to distinguish between them effectively.
+
+In contrast, the PCA-transformed data (previous plot) showed a much clearer separation between the two distributions. The same-label distances were more tightly clustered, and the different-label distances were shifted further away, reducing overlap. This improved separation in the PCA-transformed space suggests that dimensionality reduction not only preserves the essential structure of the data but also enhances class separability, making it more suitable for classification tasks. Overall, the PCA transformation improves clarity and reduces ambiguity in the distance-based analysis of the data.
+
+# PART B
+
+## A) FUNCTION PCA + FDA
+
+To implement a facial recognizer based on **Fisher Discriminant Analysis (FDA)**, we first reduce the dimensionality of the dataset using **Principal Component Analysis (PCA)** to address computational limitations. FDA is then applied to the reduced dataset to find the directions that maximize the separation between different classes (individuals). Below is an explanation of the provided implementation.
+
+The implementation of the Fisher Discriminant Analysis (FDA) begins with an initial validation of the input data. The function ensures that the number of rows in the feature matrix matches the length of the label vector, as each feature vector must have a corresponding label. Labels are then converted into factors to identify the number of unique classes in the dataset, which is essential for the subsequent steps of dimensionality reduction and FDA.
+
+To address the high dimensionality of the data, the first stage applies **Principal Component Analysis (PCA)** to reduce the feature space. The feature matrix is centered and scaled to normalize the data, ensuring that each feature has a mean of zero and unit variance. The PCA process then computes a covariance matrix, which is decomposed into eigenvalues and eigenvectors. The eigenvalues indicate the variance explained by each principal component, and the eigenvectors define the directions of maximum variance. Only the first `num_classes - 1` components are retained, projecting the data into a reduced PCA space while preserving the class-specific structure.
+
+With the data now represented in a lower-dimensional space, the second stage performs **Fisher Discriminant Analysis (FDA)**. This step focuses on finding directions that **maximize** the separation between classes. The global mean of the PCA-reduced data is calculated, followed by the construction of two scatter matrices: the **between-class scatter** matrix (`Sb`) and the **within-class scatter** matrix (`Sw`). The `Sb` matrix captures the spread of class means relative to the global mean, while the `Sw` matrix measures the variability of samples within each class. These matrices are then used to solve a generalized eigenvalue problem, where the eigenvectors represent the Fisher discriminant directions, and the eigenvalues indicate the variance explained by each discriminant.
+
+Finally, the function returns the results, including the **mean** and **standard deviation** of the original features, the **PCA and FDA projection matrices**, and the corresponding **eigenvalues**.
+
+```{r}
+PcaFish_func <- function(features, labels) {
+  if (nrow(features) != length(labels)) {
+    stop("The number of rows in features must match the length of labels.")
+  }
+  
+  # Convert labels to factor and get the number of classes
+  nlabels <- as.factor(labels)
+  num_classes <- nlevels(nlabels)
+  
+  ## Initial dimensionality reduction
+  
+  # Center and scale the data
+  G <- scale(features, center = TRUE, scale = TRUE)
+  mean.tr <- colMeans(features)  # Mean of each feature
+  sd.tr <- apply(features, 2, sd)  # Standard deviation of each feature
+  
+  # Reduced covariance matrix
+  sigma.short <- G %*% t(G) / (nrow(G) - 1)
+  
+  # Eigenvalue decomposition
+  eig <- eigen(sigma.short)
+  D_pca <- eig$values  # Eigenvalues
+  vectors.short <- eig$vectors  # Eigenvectors
+  
+  # Project the data into PCA space
+  P_pca <- t(G) %*% vectors.short  # Eigenvectors in the original space
+  pca_vec <- P_pca[, 1:(num_classes - 1), drop = FALSE]  
+  
+  # Project data into the new PCA space
+  newData <- G %*% pca_vec  
+  
+  ## Fisher Discriminant Analysis on the reduced data
+  
+  # Calculate the global mean in the reduced space
+  totalMean <- colMeans(newData)
+  Sb <- matrix(0, ncol(newData), ncol(newData))  # Between-class scatter matrix
+  Sw <- matrix(0, ncol(newData), ncol(newData))  # Within-class scatter matrix
+  
+  for (label in unique(labels)) {
+    class_data <- newData[labels == label, , drop = FALSE]
+    class_mean <- colMeans(class_data)
+    n_k <- nrow(class_data)
+    
+    # Between-class scatter
+    mean_diff <- matrix(class_mean - totalMean, ncol = 1)
+    Sb <- Sb + n_k * (mean_diff %*% t(mean_diff))
+    
+    # Within-class scatter
+    Sw <- Sw + cov(class_data) * (n_k - 1)
+  }
+  
+  # Solve the generalized eigenvalue problem
+  Sw_inv <- solve(Sw)
+  eigFish <- eigen(Sw_inv %*% Sb)
+  
+  P_fda <- eigFish$vectors  
+  D_fda <- eigFish$values   
+  
+  
+  return(list(
+    mean = mean.tr,
+    sd = sd.tr,
+    P_pca = pca_vec,  # PCA matrix
+    P_fda = P_fda,    # FDA matrix
+    D_pca = D_pca,    # PCA eigenvalues
+    D_fda = D_fda,    # FDA eigenvalues
+    labels = labels
+  ))
+}
+```
+
+## B) FUNCTION KNN + PCA + FDA
+
+The `fda_knn_classifier` function processes each test image as follows:
+
+1.  **Training Data Dimensionality Reduction:**
+
+    -   **PCA Projection:** The training data is first projected into a lower-dimensional PCA space using the `PcaFish_func`. This step addresses high-dimensional datasets by reducing the data to a manageable size while retaining class-specific information.
+
+    -   **FDA Projection:** The PCA-reduced data is further projected into the FDA space. This maximizes class separability by finding directions that best distinguish the classes.
+
+2.  **Test Image Projection:**
+
+    -   The test image is preprocessed by centering it using the mean of the training data (`fda_mean`) and projecting it into the PCA space. It is then projected further into the FDA space using the precomputed FDA matrix.
+
+3.  **K-NN Classification:**
+
+    -   The K-NN classifier (`final_knn`) is used to classify the test image in the FDA space. The predicted label corresponds to the majority class among the `k` nearest neighbors.
+
+4.  **Validation of Prediction:**
+
+    -   **First Threshold (Intra-Class Comparison)**:
+
+        -   For the predicted class, all training images belonging to this class are extracted in their FDA-transformed form.
+
+        -   The pairwise Manhattan distances between these images are calculated to establish the class-specific intra-class variability.
+
+        -   The Manhattan distances between the test image and each class-specific image are then computed.
+
+        -   A threshold is applied: if most of these distances fall within the intra-class variability (with a 10% margin), the prediction is considered valid.
+
+    -   **Second Threshold (Inter-Class Comparison)**:
+
+        -   If the first threshold fails, the algorithm considers the training images from the nearest neighboring classes (based on the k-NN results).
+
+        -   The Manhattan distances between the test image and these neighboring class images are calculated.
+
+        -   A secondary threshold is applied with a 10% margin, considering inter-class distances. If valid, the test image is reassigned to the neighboring class.
+
+5.  **Final Decision:**
+
+    -   If the test image satisfies either threshold, the predicted label is returned as the final classification result.
+    -   If neither threshold is satisfied, the function returns `0`, indicating uncertainty about the classification.
+
+```{r}
+fda_knn_classifier <- function(test_image, train_data, train_labels, fda_func, k = 3, variance_threshold = 0.95) {
+  # Apply PCA + FDA to the training data
+  fda_result <- fda_func(train_data, train_labels)
+  pca_matrix <- fda_result$P_pca
+  fda_matrix <- fda_result$P_fda
+  fda_mean <- fda_result$mean
+ 
+  # Project the test image into PCA space
+  if (is.vector(test_image)) {
+    test_image <- t(as.matrix(test_image))
+  }
+  centered_image <- scale(test_image, center = fda_mean, scale = FALSE)  
+  reduced_pca_image <- centered_image %*% pca_matrix
+  
+  # Project the PCA image into FDA space
+  reduced_fda_image <- reduced_pca_image %*% fda_matrix
+  
+  # Project training data into PCA and FDA spaces
+  centered_train_data <- scale(train_data, center = fda_mean, scale = FALSE)
+  reduced_train_pca <- centered_train_data %*% pca_matrix
+  reduced_train_fda <- reduced_train_pca %*% fda_matrix
+  
+  # Classify using k-NN
+  knn_result <- final_knn(
+    test_image = reduced_fda_image,
+    train_data = reduced_train_fda,
+    train_labels = train_labels,
+    k = k
+  )
+  
+  predicted_class <- knn_result$predicted_label
+  neighbors <- knn_result$nearest_neighbors
+
+  # Use the reduced FDA-transformed data for all threshold calculations
+  # Filter images belonging to the predicted class
+  class_indices <- which(train_labels == predicted_class)
+  class_images <- reduced_train_fda[class_indices, , drop = FALSE]  # Use FDA-transformed data
+
+  # 1. Calculate the pairwise distances between the images of the predicted class (Manhattan distance)
+  pairwise_distances <- dist(class_images, method = "manhattan")
+  pairwise_distances <- as.numeric(pairwise_distances)
+  
+  # 2. Calculate the Manhattan distances from the test image to each image of the predicted class
+  distances_to_class <- apply(class_images, 1, function(x) sum(abs(x - reduced_fda_image)))
+  
+  
+  # 3. First threshold: Check if any test image distance is <= any pairwise distance (+10% deviation)
+  first_threshold_results <- sapply(distances_to_class, function(dist) {
+    any(dist <= (pairwise_distances + 0.1 * pairwise_distances))
+  })
+  
+    if (any(first_threshold_results)) {
+    return(list(result_1 = predicted_class, result_2 = predicted_class))
+  } else {
+    # If the first threshold fails, check other neighbors with the second threshold
+    for (neighbor_idx in neighbors) {
+      neighbor_label <- train_labels[neighbor_idx]
+      if (neighbor_label != predicted_class) {
+        # Get images for the current neighbor class
+        neighbor_class_indices <- which(train_labels == neighbor_label)
+        neighbor_class_images <- reduced_train_fda[neighbor_class_indices, , drop = FALSE]  # Use FDA-transformed data
+        
+        # Calculate distances to the test image
+        neighbor_distances <- apply(neighbor_class_images, 1, function(x) sum(abs(x - reduced_fda_image)))
+        
+        # Check if any distance is valid using the same logic
+        neighbor_pairwise_distances <- dist(neighbor_class_images, method = "manhattan")
+        neighbor_pairwise_distances <- as.numeric(neighbor_pairwise_distances)
+        second_threshold_results <- sapply(neighbor_distances, function(dist) {
+          any(dist <= (neighbor_pairwise_distances + 0.1 * neighbor_pairwise_distances))
+        })
+        
+        if (any(second_threshold_results)) {
+          return(list(result_1 = neighbor_label, result_2 = predicted_class))
+        }
+      }
+    }
+    
+    # If no valid neighbor class is found, return 0
+    return(list(result_1 = 0, result_2 = predicted_class))
+  }
+}
+
+```
+
+The `predict_fda_knn` function processes a batch of test images using the FDA + k-NN classifier. For each test image:
+
+1.  The `fda_knn_classifier` function is applied.
+
+2.  Two sets of results are collected:
+
+    -   **`result_1`:** The predicted class or `0` if the prediction fails the reliability check.
+
+    -   **`result_2`:** The predicted class without the reliability check.
+
+```{r}
+predict_fda_knn <- function(test_data, train_data, train_labels, fda_func, k = 3, variance_threshold = 0.95) {
+  results <- lapply(1:nrow(test_data), function(i) {
+    fda_knn_classifier(
+      test_image = test_data[i, ],       
+      train_data = train_data,         
+      train_labels = train_labels,     
+      fda_func = fda_func,               
+      k = k,                            
+      variance_threshold = variance_threshold  
+    )
+  })
+  
+
+  result_1 <- sapply(results, function(x) x$result_1) 
+  result_2 <- sapply(results, function(x) x$result_2) 
+  
+  return(list(result_1 = result_1, result_2 = result_2))
+}
+
+```
+
+**Primary Accuracy:**
+
+-   The accuracy of the classifier is calculated by comparing `result_2` (predicted labels without the reliability check) against the true test labels. This measures the model's general classification performance.
+
+**Secondary Accuracy:**
+
+-   The reliability of `result_1` (predictions after the reliability check) is evaluated using `evaluate_label_existence`. This function ensures:
+
+    -   If the prediction is `0`, the true label is not in the training dataset.
+
+    -   If the prediction is a valid label, it matches the true label.
+
+```{r}
+predicted_results <- predict_fda_knn(
+  test_data = test_data,      
+  train_data = train_data,     
+  train_labels = train_labels, 
+  fda_func = PcaFish_func,   
+  k = 3,                       
+  variance_threshold = 0.95    
+)
+
+# Obtain the classification results
+predicted_labels_1 <- predicted_results$result_1  
+predicted_labels_2 <- predicted_results$result_2  
+
+
+```
+
+```{r}
+# Evaluate primary accuracy
+accuracy <- mean(predicted_labels_2 == test_labels)  
+cat("FDA + k-NN Classifier Accuracy:", accuracy, "\n")  
+
+accuracy_2 <- evaluate_label_existence(
+  predicted_labels = predicted_labels_1,  
+  test_labels = test_labels,              
+  train_labels = train_labels             
+)
+cat("Secondary Accuracy (Validation of label presence in the dataset):", accuracy_2, "\n")  
+```
+
+The FDA + k-NN classifier achieved an impressive **classification accuracy of 1**. This indicates that the model correctly predicted the labels for all test images in terms of assigning them to the appropriate class based on their nearest neighbors in the FDA-transformed space. The use of FDA significantly improved class separability, which was key to achieving perfect classification accuracy.
+
+However, the **secondary accuracy (validation of label presence in the dataset) was 0.96**. This slight reduction highlights cases where the model's distance-based thresholds failed to confirm the presence of a test image within its predicted class. Specifically, one image exhibited unusually large distances to the other images in its predicted class. This suggests that the test image might be an **outlier** relative to its class, leading to uncertainty about its membership within the dataset.
+
+The discrepancy between primary and secondary accuracy underscores the importance of validating predictions using distance-based metrics.
+
+The following code is designed to test whether there are any outliers within the images of a specific class (class `13`) after applying PCA and FDA transformations. By computing pairwise Manhattan distances between the images in the transformed space, the code evaluates intra-class variability. The outliers are identified using the interquartile range (IQR) method, which detects data points with significantly different distances compared to the majority. This helps determine if any images deviate unusually from their class-specific distribution in the transformed space.
+
+*Note: If while executing this part of the code you get an error (shouldn't happen, just in case) run again the cells where we load the data and split between train and test. Then execute this cell again and no errors should appear.*
+
+```{r}
+# Function to detect outliers based on distances
+detect_outliers <- function(class_distances, threshold = 1.5) {
+  # Compute IQR (Interquartile Range)
+  Q1 <- quantile(class_distances, 0.25)
+  Q3 <- quantile(class_distances, 0.75)
+  IQR <- Q3 - Q1
+  
+  # Define outlier threshold
+  lower_bound <- Q1 - threshold * IQR
+  upper_bound <- Q3 + threshold * IQR
+  
+  # Identify outliers
+  outliers <- class_distances[class_distances < lower_bound | class_distances > upper_bound]
+  return(outliers)
+}
+
+
+data <- features[train_indices, ]
+labels <- labels[train_indices]
+
+fda_result <- PcaFish_func(data, labels)
+pca_matrix <- fda_result$P_pca
+fda_matrix <- fda_result$P_fda
+fda_mean <- fda_result$mean
+
+centered_data <- scale(data, center = fda_mean, scale = FALSE)
+reduced_pca <- centered_data %*% pca_matrix
+reduced_fda <- reduced_pca %*% fda_matrix
+
+class_indices <- which(train_labels == 13)
+class_images <- reduced_fda[class_indices, , drop = FALSE]
+  
+pairwise_distances <- dist(class_images, method = "manhattan")
+pairwise_distances <- as.numeric(pairwise_distances)
+
+# Detect outliers
+outliers <- detect_outliers(pairwise_distances)
+
+# Output results
+if (length(outliers) > 0) {
+  cat("Outliers detected:\n", outliers, "\n")
+} else {
+  cat("No outliers detected.\n")
+}
+
+```
+
+It appears as an outlier after applying PCA and FDA because these transformations fundamentally change the data's representation. PCA reduces the dimensionality by retaining directions of maximum variance, potentially emphasizing previously subtle differences. FDA further transforms the data to maximize class separability, enhancing distinctions between and within classes. As a result, the spatial relationships among data points can shift, causing certain images that were relatively close in the original space to exhibit disproportionately large distances in the transformed space. This indicates that the transformations have highlighted unique features or patterns in the outlier image that differentiate it from the rest of its class, making its behavior stand out in the reduced, discriminative feature space.
+
+### DISTRIBUTION PLOT FOR DISTANCES
+
+This process uses once again the function `calculate-distances`. However, now the data is transformed in a different way. Once FDA is applied to the dataset using the `PcaFish_func` function, this function is used after applying PCA to the original dataset (`reduced_pca`) to analyze how well FDA organizes the data by class. The resulting distances are then visualized in a density plot, highlighting the distinction between intra-class (same label) and inter-class (different labels) distances. This allows for an evaluation of the effectiveness of FDA in clustering similar data points and maximizing the separability between different classes.
+
+```{r}
+# Apply PCA and FDA, then compute distances
+fda_result <- PcaFish_func(train_data, train_labels)  # Apply PCA + FDA
+pca_matrix <- fda_result$P_pca
+fda_matrix <- fda_result$P_fda
+fda_mean <- fda_result$mean
+
+# Project training data into PCA and FDA spaces
+centered_training_data <- scale(train_data, center = fda_mean, scale = FALSE)  # Center with FDA mean
+reduced_pca <- centered_training_data %*% pca_matrix  # PCA projection
+reduced_fda <- reduced_pca %*% fda_matrix  # FDA projection
+
+# Compute distances in the FDA-transformed space
+distances <- calculate_distances(reduced_fda, train_labels)
+
+# Create a data frame for plotting
+distance_data <- data.frame(
+  Distance = c(distances$same, distances$different),
+  Type = c(rep("Same Label", length(distances$same)), rep("Different Labels", length(distances$different)))
+)
+
+# Plot the density
+ggplot(distance_data, aes(x = Distance, fill = Type)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("orange", "purple")) +
+  labs(
+    title = "Density Plot of Pairwise Distances (FDA)",
+    x = "Distance",
+    y = "Density",
+    fill = "Distance Type"
+  ) +
+  theme_minimal()
+
+```
+
+The Fisher Discriminant Analysis (FDA) plot reveals a highly effective separation between intra-class and inter-class distances. The purple density curve, representing intra-class distances (same label), is tightly concentrated near zero. This indicates that data points within the same class are extremely close to one another in the FDA-transformed space. Such a distribution reflects FDA's strength in minimizing intra-class variability, allowing for robust clustering of data points belonging to the same class.
+
+On the other hand, the orange density curve, representing inter-class distances (different labels), is centered at significantly higher values, showing a clear separation from the intra-class distances. This pronounced gap between the two distributions demonstrates that FDA has effectively maximized the distance between different classes, enhancing class separability.
+
+**Comparison with PCA and Original Data**
+
+When compared to the PCA and original data plots, the FDA plot shows the most distinct separation between intra-class and inter-class distances. In the original data plot, there was substantial overlap between the two distributions, indicating that the classes were poorly separated in the original feature space. After applying PCA, the separation improved, with less overlap between the distributions. However, some overlap persisted, showing that PCA alone could not fully differentiate the classes.
+
+In contrast, the FDA plot demonstrates a near-complete separation. Intra-class distances are tightly concentrated near zero, while inter-class distances form a distinct peak at much larger values. This improvement highlights FDA's ability to explicitly maximize class separability, which is not the focus of PCA.
+
+### CONCLUSION
+
+The FDA plot illustrates the superior performance of Fisher Discriminant Analysis in creating clear distinctions between classes. Compared to PCA and the original data, FDA achieves the best clustering of intra-class points and the clearest separation of inter-class points. This makes FDA a more suitable technique in scenarios where class separability is a critical requirement. The results highlight FDA's ability to transform the feature space into one that emphasizes meaningful differences between classes, outperforming PCA in this regard.
+
+## C) DETERMINING PREVIOUS PARAMETERS
+
+The parameters used for the Fisher Discriminant Analysis section, such as the calculation of pairwise distances, the distance metric (Manhattan distance), and the way we categorized distances into "Same Label" and "Different Labels," were deliberately chosen to match those used in the PCA section. This consistency allows us to make a fair and direct comparison between the two approaches.
+
+In both the PCA and FDA sections:
+
+-   **Distance Metric**: We used the Manhattan distance, ensuring that the measure of similarity or dissimilarity between data points remained the same.
+
+-   **Categories of Distances**: Distances were divided into intra-class (same label) and inter-class (different labels), making it possible to directly assess how each technique clusters similar points and separates different ones.
+
+-   **Variance Retained by the PCs:** it was kept consistent with the threshold used in the PCA-only section. The variance threshold of 95% was used in both cases.
+
+-   **Number of neighbors for K-NN:** The parameter $k$ for the k-NN classifier remained fixed at $k=3$, as established during hyperparameter optimization in the PCA section.
+
+-   **The Threshold for Determining Database Membership:** The same threshold mechanism, with a 10% margin adjustment for intra-class distances, was applied to validate membership in both the PCA and FDA sections.
+
+By maintaining identical parameters and preprocessing steps, we ensure that the differences in the resulting plots and analyses are solely attributable to the techniques themselves---PCA versus FDA---and not to variations in methodology. This makes the comparison robust and highlights the specific advantages of each approach. For instance, while PCA focuses on maximizing variance, FDA explicitly optimizes class separability. Observing the same parameters across both methods allows us to clearly demonstrate FDA's superior performance in separating inter-class and intra-class distances, as evidenced by the greater distinction in the density plot.
+
+This methodology enables a comprehensive and unbiased evaluation of the two techniques, offering clear insights into their relative strengths and limitations in clustering and class separation tasks.
